@@ -2,7 +2,8 @@
 cmake_minimum_required(VERSION 3.10)
 
 # 设置项目名称
-PROJECT(rk_cmake_project)
+PROJECT(rk_yolov8_pose_demo)
+set(EXECUTABLE_NAME rk_yolov8_pose_demo)
 
 # 设置C++标准
 set(CMAKE_CXX_STANDARD 11)
@@ -21,7 +22,7 @@ include_directories(
     # rknn 相关头文件
     ${CMAKE_SOURCE_DIR}/include/rknn/rknpu2
     ${CMAKE_SOURCE_DIR}/include/rknn/utils
-    ${CMAKE_SOURCE_DIR}/include/rknn/yolov8
+    ${CMAKE_SOURCE_DIR}/include/rknn/yolov8_pose
     ${CMAKE_SOURCE_DIR}/include/rknn/librga
     ${CMAKE_SOURCE_DIR}/include/rknn/stb_image
     ${CMAKE_SOURCE_DIR}/include/rknn/jpeg_turbo
@@ -36,8 +37,8 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/src/rknn/utils/file_utils.c
     ${CMAKE_SOURCE_DIR}/src/rknn/utils/image_drawing.c
     ${CMAKE_SOURCE_DIR}/src/rknn/utils/image_utils.c
-    ${CMAKE_SOURCE_DIR}/src/rknn/yolov8/postprocess.cc
-    ${CMAKE_SOURCE_DIR}/src/rknn/yolov8/yolov8.cc
+    ${CMAKE_SOURCE_DIR}/src/rknn/yolov8_pose/postprocess.cc
+    ${CMAKE_SOURCE_DIR}/src/rknn/yolov8_pose/yolov8_pose.cc
 )
 
 # 添加库文件路径
@@ -46,10 +47,10 @@ link_directories(
 )
 
 # 添加目标可执行文件
-add_executable(rk_cmake_project ${SOURCES})
+add_executable(${EXECUTABLE_NAME} ${SOURCES})
 
 # 添加链接库
-target_link_libraries(rk_cmake_project 
+target_link_libraries(${EXECUTABLE_NAME} 
     pthread
     rockit
     rt_test_comm

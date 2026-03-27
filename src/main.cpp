@@ -37,7 +37,7 @@
 #include <thread>
 #include <opencv2/opencv.hpp>
 #include <opencv/cv.hpp>
-#include "yolov8.h"
+#include "yolov8_pose.h"
 #include "image_utils.h"
 #include "file_utils.h"
 #include "image_drawing.h"
@@ -48,7 +48,7 @@
 
 // rknn 相关变量
 rknn_app_context_t rknn_app_ctx;
-const char *model_path = "/root/rknn_yolov8_demo/model/yolov8n.rknn";
+const char *model_path = "/root/rknn_yolov8_pose_demo/model/yolov8n-pose.rknn";
 
 // mpi 相关变量
 int width    = DISP_WIDTH;
@@ -60,6 +60,8 @@ unsigned char *data = nullptr;  // 指向缓存块的指针
 // 用于fps显示
 char fps_text[16];
 float fps = 0;
+int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8,
+                    7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
 
 // 线程池
 ThreadPool rknnPool(2);
@@ -155,10 +157,10 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 
 	// 执行推理
 	object_detect_result_list od_results;
-	int ret = inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+	int ret = inference_yolov8_pose_model(&rknn_app_ctx, &src_image, &od_results);
 	if (ret != 0)
 	{
-		printf("inference_yolov8_model fail! ret=%d\n", ret);
+		printf("inference_yolov8_pose_model fail! ret=%d\n", ret);
 	}
 
 	// 画框和概率
@@ -179,6 +181,20 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 
 		sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
 		draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
+
+		for (int j = 0; j < 38 / 2; ++j)
+		{
+			draw_line(&src_image, (int)(det_result->keypoints[skeleton[2 * j] - 1][0]),
+					  (int)(det_result->keypoints[skeleton[2 * j] - 1][1]),
+					  (int)(det_result->keypoints[skeleton[2 * j + 1] - 1][0]),
+					  (int)(det_result->keypoints[skeleton[2 * j + 1] - 1][1]), COLOR_ORANGE, 3);
+		}
+
+		for (int j = 0; j < 17; ++j)
+		{
+			draw_circle(&src_image, (int)(det_result->keypoints[j][0]),
+						(int)(det_result->keypoints[j][1]), 1, COLOR_YELLOW, 1);
+		}
 	}
 
 	// 转换为RGB888格式
@@ -218,11 +234,11 @@ int main(int argc, char *argv[]) {
 	/******************************* rknn 相关初始化 *******************************/
     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
     init_post_process();
-    int ret = init_yolov8_model(model_path, &rknn_app_ctx);
-    if (ret != 0)
-    {
-        printf("init_yolov8_model fail! ret=%d model_path=%s\n", ret, model_path);
-    }
+	    int ret = init_yolov8_pose_model(model_path, &rknn_app_ctx);
+	    if (ret != 0)
+	    {
+	        printf("init_yolov8_pose_model fail! ret=%d model_path=%s\n", ret, model_path);
+	    }
 
 	/******************************* mpi 相关初始化 *******************************/
 	RK_S32 s32Ret = 0; 
@@ -340,6 +356,9 @@ int main(int argc, char *argv[]) {
 	free(stFrame.pstPack);
 	
 	RK_MPI_SYS_Exit();
+
+	deinit_post_process();
+	release_yolov8_pose_model(&rknn_app_ctx);
 
 	return 0;
 }
