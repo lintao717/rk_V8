@@ -466,7 +466,7 @@ static int get_rga_fmt(image_format_t fmt) {
     }
 }
 
-int get_image_size(image_buffer_t* image)
+int get_image_size(const image_buffer_t* image)
 {
     if (image == NULL) {
         return 0;
@@ -623,7 +623,7 @@ static int convert_image_rga(image_buffer_t* src_img, image_buffer_t* dst_img, i
     if (drect.width != dstWidth || drect.height != dstHeight) {
         im_rect dst_whole_rect = {0, 0, dstWidth, dstHeight};
         int imcolor;
-        char* p_imcolor = &imcolor;
+        unsigned char* p_imcolor = (unsigned char*)&imcolor;
         p_imcolor[0] = color;
         p_imcolor[1] = color;
         p_imcolor[2] = color;
