@@ -83,13 +83,15 @@ static const int TRACK_MAX_MISSED_KEEP = 8;
 static const int TRACK_FRAME_MS = 66;
 // Prioritize full skeleton rendering. Disable this if too many noisy joints appear.
 static const bool FORCE_DRAW_ALL_KEYPOINTS = true;
-static const float FORCE_DRAW_MIN_POINT_CONF = 0.12f;
-static const float FORCE_DRAW_MIN_LINE_CONF = 0.15f;
-static const float TOPOLOGY_STRONG_CONF = 0.35f;
+static const float FORCE_DRAW_MIN_POINT_CONF = 0.10f;
+static const float FORCE_DRAW_MIN_LINE_CONF = 0.14f;
+static const float TOPOLOGY_STRONG_CONF = 0.28f;
 static const float TOPOLOGY_BBOX_PAD_X_RATIO = 0.35f;
 static const float TOPOLOGY_BBOX_PAD_Y_RATIO = 0.20f;
 static const float TOPOLOGY_MAX_LIMB_DIAG_RATIO = 0.65f;
-static const float TOPOLOGY_MAX_NEIGHBOR_SIDE_RATIO = 0.55f;
+static const float TOPOLOGY_MAX_NEIGHBOR_SIDE_RATIO = 0.75f;
+static const float TOPOLOGY_UPPER_BELOW_HIP_ALLOW_RATIO = 0.20f;
+static const float TOPOLOGY_LOWER_ABOVE_HIP_ALLOW_RATIO = 0.05f;
 
 // 线程池
 ThreadPool rknnPool(2);
@@ -191,6 +193,24 @@ static bool has_strong_neighbor(int kpt_idx, float keypoints[KEYPOINT_NUM][3], f
 	return false;
 }
 
+static float estimate_hip_center_y(float keypoints[KEYPOINT_NUM][3], const image_rect_t &box, float weak_conf) {
+	const int lhip = 11;
+	const int rhip = 12;
+	const bool lhip_ok = keypoints[lhip][2] >= weak_conf;
+	const bool rhip_ok = keypoints[rhip][2] >= weak_conf;
+	if (lhip_ok && rhip_ok) {
+		return 0.5f * (keypoints[lhip][1] + keypoints[rhip][1]);
+	}
+	if (lhip_ok) {
+		return keypoints[lhip][1];
+	}
+	if (rhip_ok) {
+		return keypoints[rhip][1];
+	}
+	const float box_h = std::max(1.0f, (float)(box.bottom - box.top));
+	return (float)box.top + box_h * 0.58f;
+}
+
 static void filter_keypoints_topology(float keypoints[KEYPOINT_NUM][3], const image_rect_t &box, int img_w, int img_h) {
 	const float box_w = std::max(1.0f, (float)(box.right - box.left));
 	const float box_h = std::max(1.0f, (float)(box.bottom - box.top));
@@ -215,6 +235,24 @@ static void filter_keypoints_topology(float keypoints[KEYPOINT_NUM][3], const im
 		}
 		if ((keypoints[j][0] < min_x || keypoints[j][0] > max_x ||
 			 keypoints[j][1] < min_y || keypoints[j][1] > max_y) &&
+			keypoints[j][2] < TOPOLOGY_STRONG_CONF) {
+			keypoints[j][2] *= 0.2f;
+		}
+	}
+
+	const float hip_center_y = estimate_hip_center_y(keypoints, box, weak_conf);
+	for (int j = 0; j < KEYPOINT_NUM; ++j) {
+		if (keypoints[j][2] <= 0.0f) {
+			continue;
+		}
+		const float y = keypoints[j][1];
+		const bool is_upper = (j <= 10);
+		const bool is_lower = (j >= 13);
+		if (is_upper && y > hip_center_y + box_h * TOPOLOGY_UPPER_BELOW_HIP_ALLOW_RATIO &&
+			keypoints[j][2] < TOPOLOGY_STRONG_CONF) {
+			keypoints[j][2] *= 0.2f;
+		}
+		if (is_lower && y < hip_center_y - box_h * TOPOLOGY_LOWER_ABOVE_HIP_ALLOW_RATIO &&
 			keypoints[j][2] < TOPOLOGY_STRONG_CONF) {
 			keypoints[j][2] *= 0.2f;
 		}
