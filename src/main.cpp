@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <opencv2/opencv.hpp>
 #include <opencv/cv.hpp>
 #include "yolov8_pose.h"
@@ -70,8 +71,8 @@ int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 
                     7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
 static const int KEYPOINT_NUM = 17;
 static const float DRAW_BOX_THRESH = 0.82f;
-static const float DRAW_POINT_THRESH = 0.05f;
-static const float DRAW_LINE_THRESH = 0.03f;
+static const float DRAW_POINT_THRESH = 0.10f;
+static const float DRAW_LINE_THRESH = 0.05f;
 static const int DRAW_MIN_KPT_NUM = 1;
 static const float DRAW_MIN_BOX_AREA_RATIO = 0.015f;
 static const float TRACK_MATCH_IOU_THRESH = 0.30f;
@@ -80,6 +81,8 @@ static const float TRACK_EMA_ALPHA = 0.60f;
 static const int TRACK_MAX_MISSED_FOR_REPAIR = 5;
 static const int TRACK_MAX_MISSED_KEEP = 8;
 static const int TRACK_FRAME_MS = 66;
+// Prioritize full skeleton rendering. Disable this if too many noisy joints appear.
+static const bool FORCE_DRAW_ALL_KEYPOINTS = true;
 
 // 线程池
 ThreadPool rknnPool(2);
@@ -130,6 +133,28 @@ static float calc_iou(const image_rect_t &a, const image_rect_t &b) {
 	return inter_area / union_area;
 }
 
+static float normalize_kpt_conf(float conf) {
+	if (!std::isfinite(conf)) {
+		return 0.0f;
+	}
+	if (conf < 0.0f || conf > 1.0f) {
+		// Some exported pose heads expose keypoint confidence as logits.
+		return 1.0f / (1.0f + std::exp(-conf));
+	}
+	return conf;
+}
+
+static bool is_finite_kpt_xy(float x, float y) {
+	return std::isfinite(x) && std::isfinite(y);
+}
+
+static bool is_drawable_kpt_xy(float x, float y, int img_w, int img_h) {
+	if (!is_finite_kpt_xy(x, y)) {
+		return false;
+	}
+	return (x >= 0.0f && y >= 0.0f && x < (float)img_w && y < (float)img_h);
+}
+
 static void cleanup_pose_tracks_locked(uint64_t now_ms) {
 	g_pose_tracks.erase(std::remove_if(g_pose_tracks.begin(), g_pose_tracks.end(),
 									   [now_ms](PoseTrack &track) {
@@ -173,19 +198,25 @@ static void repair_keypoints_from_track(float keypoints[KEYPOINT_NUM][3], const 
 		return;
 	}
 	for (int j = 0; j < KEYPOINT_NUM; ++j) {
-		float curr_conf = keypoints[j][2];
-		float prev_conf = track.keypoints[j][2];
+		float curr_conf = normalize_kpt_conf(keypoints[j][2]);
+		float prev_conf = normalize_kpt_conf(track.keypoints[j][2]);
+		keypoints[j][2] = curr_conf;
 		if (curr_conf >= DRAW_POINT_THRESH || prev_conf < TRACK_PREV_KPT_MIN_CONF) {
 			continue;
 		}
-		if (curr_conf > 0.0f) {
+		bool curr_xy_ok = is_finite_kpt_xy(keypoints[j][0], keypoints[j][1]);
+		bool prev_xy_ok = is_finite_kpt_xy(track.keypoints[j][0], track.keypoints[j][1]);
+		if (!prev_xy_ok) {
+			continue;
+		}
+		if (curr_conf > 0.0f && curr_xy_ok) {
 			keypoints[j][0] = TRACK_EMA_ALPHA * keypoints[j][0] + (1.0f - TRACK_EMA_ALPHA) * track.keypoints[j][0];
 			keypoints[j][1] = TRACK_EMA_ALPHA * keypoints[j][1] + (1.0f - TRACK_EMA_ALPHA) * track.keypoints[j][1];
 		} else {
 			keypoints[j][0] = track.keypoints[j][0];
 			keypoints[j][1] = track.keypoints[j][1];
 		}
-		keypoints[j][2] = std::max(curr_conf, prev_conf * 0.9f);
+		keypoints[j][2] = normalize_kpt_conf(std::max(curr_conf, prev_conf * 0.9f));
 	}
 }
 
@@ -348,7 +379,7 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 		{
 			draw_keypoints[j][0] = det_result->keypoints[j][0];
 			draw_keypoints[j][1] = det_result->keypoints[j][1];
-			draw_keypoints[j][2] = det_result->keypoints[j][2];
+			draw_keypoints[j][2] = normalize_kpt_conf(det_result->keypoints[j][2]);
 		}
 
 		uint64_t matched_track_id = 0;
@@ -366,7 +397,15 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 		int valid_kpt_num = 0;
 		for (int j = 0; j < KEYPOINT_NUM; ++j)
 		{
-			if (draw_keypoints[j][2] >= DRAW_POINT_THRESH)
+			if (FORCE_DRAW_ALL_KEYPOINTS)
+			{
+				if (is_drawable_kpt_xy(draw_keypoints[j][0], draw_keypoints[j][1], src_image.width, src_image.height))
+				{
+					valid_kpt_num++;
+				}
+			}
+			else if (draw_keypoints[j][2] >= DRAW_POINT_THRESH &&
+					 is_drawable_kpt_xy(draw_keypoints[j][0], draw_keypoints[j][1], src_image.width, src_image.height))
 			{
 				valid_kpt_num++;
 			}
@@ -385,7 +424,13 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 		{
 			int p1 = skeleton[2 * j] - 1;
 			int p2 = skeleton[2 * j + 1] - 1;
-			if (draw_keypoints[p1][2] < DRAW_LINE_THRESH || draw_keypoints[p2][2] < DRAW_LINE_THRESH)
+			if (!is_drawable_kpt_xy(draw_keypoints[p1][0], draw_keypoints[p1][1], src_image.width, src_image.height) ||
+				!is_drawable_kpt_xy(draw_keypoints[p2][0], draw_keypoints[p2][1], src_image.width, src_image.height))
+			{
+				continue;
+			}
+			if (!FORCE_DRAW_ALL_KEYPOINTS &&
+				(draw_keypoints[p1][2] < DRAW_LINE_THRESH || draw_keypoints[p2][2] < DRAW_LINE_THRESH))
 			{
 				continue;
 			}
@@ -398,7 +443,11 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 
 		for (int j = 0; j < KEYPOINT_NUM; ++j)
 		{
-			if (draw_keypoints[j][2] < DRAW_POINT_THRESH)
+			if (!is_drawable_kpt_xy(draw_keypoints[j][0], draw_keypoints[j][1], src_image.width, src_image.height))
+			{
+				continue;
+			}
+			if (!FORCE_DRAW_ALL_KEYPOINTS && draw_keypoints[j][2] < DRAW_POINT_THRESH)
 			{
 				continue;
 			}
