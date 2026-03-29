@@ -12,7 +12,7 @@
 #define OBJ_NUMB_MAX_SIZE 128
 #define OBJ_CLASS_NUM 1
 #define NMS_THRESH 0.4
-#define BOX_THRESH 0.5
+#define BOX_THRESH 0.75
 #define PROP_BOX_SIZE (5 + OBJ_CLASS_NUM)
 
 typedef struct {

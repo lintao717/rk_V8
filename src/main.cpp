@@ -62,6 +62,8 @@ char fps_text[16];
 float fps = 0;
 int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8,
                     7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
+static const float DRAW_BOX_THRESH = 0.70f;
+static const float DRAW_KPT_THRESH = 0.50f;
 
 // 线程池
 ThreadPool rknnPool(2);
@@ -168,6 +170,11 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 	for (int i = 0; i < od_results.count; i++)
 	{
 		object_detect_result *det_result = &(od_results.results[i]);
+		if (det_result->prop < DRAW_BOX_THRESH)
+		{
+			continue;
+		}
+
 		printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id),
 				det_result->box.left, det_result->box.top,
 				det_result->box.right, det_result->box.bottom,
@@ -184,6 +191,13 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 
 		for (int j = 0; j < 38 / 2; ++j)
 		{
+			int p1 = skeleton[2 * j] - 1;
+			int p2 = skeleton[2 * j + 1] - 1;
+			if (det_result->keypoints[p1][2] < DRAW_KPT_THRESH || det_result->keypoints[p2][2] < DRAW_KPT_THRESH)
+			{
+				continue;
+			}
+
 			draw_line(&src_image, (int)(det_result->keypoints[skeleton[2 * j] - 1][0]),
 					  (int)(det_result->keypoints[skeleton[2 * j] - 1][1]),
 					  (int)(det_result->keypoints[skeleton[2 * j + 1] - 1][0]),
@@ -192,6 +206,11 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 
 		for (int j = 0; j < 17; ++j)
 		{
+			if (det_result->keypoints[j][2] < DRAW_KPT_THRESH)
+			{
+				continue;
+			}
+
 			draw_circle(&src_image, (int)(det_result->keypoints[j][0]),
 						(int)(det_result->keypoints[j][1]), 1, COLOR_YELLOW, 1);
 		}
