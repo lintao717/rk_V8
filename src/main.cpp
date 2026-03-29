@@ -35,6 +35,12 @@
  *****************************************************************/
 #include <iostream>
 #include <thread>
+#include <vector>
+#include <mutex>
+#include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <opencv2/opencv.hpp>
 #include <opencv/cv.hpp>
 #include "yolov8_pose.h"
@@ -62,10 +68,18 @@ char fps_text[16];
 float fps = 0;
 int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8,
                     7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
-static const float DRAW_BOX_THRESH = 0.85f;
-static const float DRAW_KPT_THRESH = 0.55f;
-static const int DRAW_MIN_KPT_NUM = 6;
-static const float DRAW_MIN_BOX_AREA_RATIO = 0.03f;
+static const int KEYPOINT_NUM = 17;
+static const float DRAW_BOX_THRESH = 0.82f;
+static const float DRAW_POINT_THRESH = 0.30f;
+static const float DRAW_LINE_THRESH = 0.25f;
+static const int DRAW_MIN_KPT_NUM = 3;
+static const float DRAW_MIN_BOX_AREA_RATIO = 0.015f;
+static const float TRACK_MATCH_IOU_THRESH = 0.30f;
+static const float TRACK_PREV_KPT_MIN_CONF = 0.20f;
+static const float TRACK_EMA_ALPHA = 0.60f;
+static const int TRACK_MAX_MISSED_FOR_REPAIR = 3;
+static const int TRACK_MAX_MISSED_KEEP = 5;
+static const int TRACK_FRAME_MS = 66;
 
 // 线程池
 ThreadPool rknnPool(2);
@@ -73,6 +87,137 @@ ThreadPool h264encPool(1);
 
 // ZLMediaKit 媒体变量
 mk_media media;
+
+struct PoseTrack {
+	uint64_t track_id;
+	image_rect_t box;
+	float keypoints[KEYPOINT_NUM][3];
+	int missed_frames;
+	uint64_t last_ts_ms;
+};
+
+std::vector<PoseTrack> g_pose_tracks;
+std::mutex g_pose_track_mutex;
+std::atomic<uint64_t> g_next_track_id(1);
+
+static uint64_t get_now_ms() {
+	auto now = std::chrono::steady_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+	return (uint64_t)duration.count();
+}
+
+static int calc_missed_frames(uint64_t now_ms, uint64_t last_ms) {
+	if (now_ms <= last_ms) {
+		return 0;
+	}
+	return (int)((now_ms - last_ms) / TRACK_FRAME_MS);
+}
+
+static float calc_iou(const image_rect_t &a, const image_rect_t &b) {
+	int left = std::max(a.left, b.left);
+	int top = std::max(a.top, b.top);
+	int right = std::min(a.right, b.right);
+	int bottom = std::min(a.bottom, b.bottom);
+	int inter_w = std::max(0, right - left);
+	int inter_h = std::max(0, bottom - top);
+	float inter_area = (float)(inter_w * inter_h);
+	float area_a = (float)(std::max(0, a.right - a.left) * std::max(0, a.bottom - a.top));
+	float area_b = (float)(std::max(0, b.right - b.left) * std::max(0, b.bottom - b.top));
+	float union_area = area_a + area_b - inter_area;
+	if (union_area <= 0.0f) {
+		return 0.0f;
+	}
+	return inter_area / union_area;
+}
+
+static void cleanup_pose_tracks_locked(uint64_t now_ms) {
+	g_pose_tracks.erase(std::remove_if(g_pose_tracks.begin(), g_pose_tracks.end(),
+									   [now_ms](PoseTrack &track) {
+										   track.missed_frames = calc_missed_frames(now_ms, track.last_ts_ms);
+										   return track.missed_frames > TRACK_MAX_MISSED_KEEP;
+									   }),
+					 g_pose_tracks.end());
+}
+
+static int find_track_index_by_id_locked(uint64_t track_id) {
+	for (size_t i = 0; i < g_pose_tracks.size(); ++i) {
+		if (g_pose_tracks[i].track_id == track_id) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+static int find_best_track_index_locked(const image_rect_t &box, uint64_t now_ms, uint64_t *matched_track_id) {
+	float best_iou = 0.0f;
+	int best_idx = -1;
+	*matched_track_id = 0;
+	for (size_t i = 0; i < g_pose_tracks.size(); ++i) {
+		PoseTrack &track = g_pose_tracks[i];
+		track.missed_frames = calc_missed_frames(now_ms, track.last_ts_ms);
+		if (track.missed_frames > TRACK_MAX_MISSED_KEEP) {
+			continue;
+		}
+		float iou = calc_iou(track.box, box);
+		if (iou >= TRACK_MATCH_IOU_THRESH && iou > best_iou) {
+			best_iou = iou;
+			best_idx = (int)i;
+			*matched_track_id = track.track_id;
+		}
+	}
+	return best_idx;
+}
+
+static void repair_keypoints_from_track(float keypoints[KEYPOINT_NUM][3], const PoseTrack &track) {
+	if (track.missed_frames > TRACK_MAX_MISSED_FOR_REPAIR) {
+		return;
+	}
+	for (int j = 0; j < KEYPOINT_NUM; ++j) {
+		float curr_conf = keypoints[j][2];
+		float prev_conf = track.keypoints[j][2];
+		if (curr_conf >= DRAW_POINT_THRESH || prev_conf < TRACK_PREV_KPT_MIN_CONF) {
+			continue;
+		}
+		if (curr_conf > 0.0f) {
+			keypoints[j][0] = TRACK_EMA_ALPHA * keypoints[j][0] + (1.0f - TRACK_EMA_ALPHA) * track.keypoints[j][0];
+			keypoints[j][1] = TRACK_EMA_ALPHA * keypoints[j][1] + (1.0f - TRACK_EMA_ALPHA) * track.keypoints[j][1];
+		} else {
+			keypoints[j][0] = track.keypoints[j][0];
+			keypoints[j][1] = track.keypoints[j][1];
+		}
+		keypoints[j][2] = std::max(curr_conf, prev_conf * 0.9f);
+	}
+}
+
+static void upsert_pose_track_locked(uint64_t matched_track_id, const image_rect_t &box,
+									 float keypoints[KEYPOINT_NUM][3], uint64_t now_ms) {
+	int idx = -1;
+	if (matched_track_id != 0) {
+		idx = find_track_index_by_id_locked(matched_track_id);
+	}
+	if (idx < 0) {
+		PoseTrack track;
+		track.track_id = g_next_track_id.fetch_add(1);
+		track.box = box;
+		track.missed_frames = 0;
+		track.last_ts_ms = now_ms;
+		for (int j = 0; j < KEYPOINT_NUM; ++j) {
+			track.keypoints[j][0] = keypoints[j][0];
+			track.keypoints[j][1] = keypoints[j][1];
+			track.keypoints[j][2] = keypoints[j][2];
+		}
+		g_pose_tracks.push_back(track);
+		return;
+	}
+	g_pose_tracks[idx].box = box;
+	g_pose_tracks[idx].missed_frames = 0;
+	g_pose_tracks[idx].last_ts_ms = now_ms;
+	for (int j = 0; j < KEYPOINT_NUM; ++j) {
+		g_pose_tracks[idx].keypoints[j][0] = keypoints[j][0];
+		g_pose_tracks[idx].keypoints[j][1] = keypoints[j][1];
+		g_pose_tracks[idx].keypoints[j][2] = keypoints[j][2];
+	}
+}
 
 /*********************************************
  * h264编码任务，包含rtsp推流
@@ -198,10 +343,30 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 			continue;
 		}
 
-		int valid_kpt_num = 0;
-		for (int j = 0; j < 17; ++j)
+		float draw_keypoints[KEYPOINT_NUM][3];
+		for (int j = 0; j < KEYPOINT_NUM; ++j)
 		{
-			if (det_result->keypoints[j][2] >= DRAW_KPT_THRESH)
+			draw_keypoints[j][0] = det_result->keypoints[j][0];
+			draw_keypoints[j][1] = det_result->keypoints[j][1];
+			draw_keypoints[j][2] = det_result->keypoints[j][2];
+		}
+
+		uint64_t matched_track_id = 0;
+		{
+			uint64_t now_ms = get_now_ms();
+			std::lock_guard<std::mutex> lock(g_pose_track_mutex);
+			cleanup_pose_tracks_locked(now_ms);
+			int matched_idx = find_best_track_index_locked(det_result->box, now_ms, &matched_track_id);
+			if (matched_idx >= 0)
+			{
+				repair_keypoints_from_track(draw_keypoints, g_pose_tracks[matched_idx]);
+			}
+		}
+
+		int valid_kpt_num = 0;
+		for (int j = 0; j < KEYPOINT_NUM; ++j)
+		{
+			if (draw_keypoints[j][2] >= DRAW_POINT_THRESH)
 			{
 				valid_kpt_num++;
 			}
@@ -220,26 +385,33 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 		{
 			int p1 = skeleton[2 * j] - 1;
 			int p2 = skeleton[2 * j + 1] - 1;
-			if (det_result->keypoints[p1][2] < DRAW_KPT_THRESH || det_result->keypoints[p2][2] < DRAW_KPT_THRESH)
+			if (draw_keypoints[p1][2] < DRAW_LINE_THRESH || draw_keypoints[p2][2] < DRAW_LINE_THRESH)
 			{
 				continue;
 			}
 
-			draw_line(&src_image, (int)(det_result->keypoints[skeleton[2 * j] - 1][0]),
-					  (int)(det_result->keypoints[skeleton[2 * j] - 1][1]),
-					  (int)(det_result->keypoints[skeleton[2 * j + 1] - 1][0]),
-					  (int)(det_result->keypoints[skeleton[2 * j + 1] - 1][1]), COLOR_ORANGE, 3);
+			draw_line(&src_image, (int)(draw_keypoints[skeleton[2 * j] - 1][0]),
+					  (int)(draw_keypoints[skeleton[2 * j] - 1][1]),
+					  (int)(draw_keypoints[skeleton[2 * j + 1] - 1][0]),
+					  (int)(draw_keypoints[skeleton[2 * j + 1] - 1][1]), COLOR_ORANGE, 3);
 		}
 
-		for (int j = 0; j < 17; ++j)
+		for (int j = 0; j < KEYPOINT_NUM; ++j)
 		{
-			if (det_result->keypoints[j][2] < DRAW_KPT_THRESH)
+			if (draw_keypoints[j][2] < DRAW_POINT_THRESH)
 			{
 				continue;
 			}
 
-			draw_circle(&src_image, (int)(det_result->keypoints[j][0]),
-						(int)(det_result->keypoints[j][1]), 1, COLOR_YELLOW, 1);
+			draw_circle(&src_image, (int)(draw_keypoints[j][0]),
+						(int)(draw_keypoints[j][1]), 1, COLOR_YELLOW, 1);
+		}
+
+		{
+			uint64_t now_ms = get_now_ms();
+			std::lock_guard<std::mutex> lock(g_pose_track_mutex);
+			cleanup_pose_tracks_locked(now_ms);
+			upsert_pose_track_locked(matched_track_id, det_result->box, draw_keypoints, now_ms);
 		}
 	}
 
