@@ -70,15 +70,15 @@ int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 
                     7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
 static const int KEYPOINT_NUM = 17;
 static const float DRAW_BOX_THRESH = 0.82f;
-static const float DRAW_POINT_THRESH = 0.30f;
-static const float DRAW_LINE_THRESH = 0.25f;
-static const int DRAW_MIN_KPT_NUM = 3;
+static const float DRAW_POINT_THRESH = 0.05f;
+static const float DRAW_LINE_THRESH = 0.03f;
+static const int DRAW_MIN_KPT_NUM = 1;
 static const float DRAW_MIN_BOX_AREA_RATIO = 0.015f;
 static const float TRACK_MATCH_IOU_THRESH = 0.30f;
-static const float TRACK_PREV_KPT_MIN_CONF = 0.20f;
+static const float TRACK_PREV_KPT_MIN_CONF = 0.05f;
 static const float TRACK_EMA_ALPHA = 0.60f;
-static const int TRACK_MAX_MISSED_FOR_REPAIR = 3;
-static const int TRACK_MAX_MISSED_KEEP = 5;
+static const int TRACK_MAX_MISSED_FOR_REPAIR = 5;
+static const int TRACK_MAX_MISSED_KEEP = 8;
 static const int TRACK_FRAME_MS = 66;
 
 // 线程池
