@@ -26,12 +26,42 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <mutex>
 #include <set>
 #include <vector>
 
 #define LABEL_NALE_TXT_PATH "/root/rknn_yolov8_pose_demo/model/yolov8_pose_labels_list.txt"
 
 static char *labels[OBJ_CLASS_NUM];
+
+// Cross-module diagnostic flags (read in src/main.cpp).
+std::atomic<int> g_pose_diag_semantic_mismatch(0);
+std::atomic<int> g_pose_diag_nms_misselection(0);
+
+static const bool POSE_DIAG_ENABLE = true;
+static const int POSE_DIAG_PRINT_EVERY_N_FRAMES = 10;
+static const float POSE_DIAG_SEMANTIC_OOR_RATIO_THRESH = 0.30f;
+static const float POSE_DIAG_NMS_KPT_MEAN_GAP_THRESH = 0.15f;
+static const float POSE_DIAG_NMS_IOU_THRESH = 0.50f;
+
+struct PosePostDiagAgg {
+    uint64_t frame_count = 0;
+    uint64_t candidates_before_nms_sum = 0;
+    uint64_t candidates_after_nms_sum = 0;
+    uint64_t raw_conf_count = 0;
+    uint64_t raw_conf_neg = 0;
+    uint64_t raw_conf_in_01 = 0;
+    uint64_t raw_conf_gt1 = 0;
+    double raw_conf_sum = 0.0;
+    uint64_t nms_misselection_events = 0;
+};
+
+static PosePostDiagAgg g_pose_post_diag_agg;
+static std::mutex g_pose_post_diag_mutex;
+
+static float deqnt_affine_u8_to_f32(uint8_t qnt, int32_t zp, float scale);
 
 inline static int clamp(float val, int min, int max) { return val > min ? (val < max ? val : max) : min; }
 
@@ -185,6 +215,58 @@ static int quick_sort_indice_inverse(std::vector<float> &input, int left, int ri
 static float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 static float unsigmoid(float y) { return -1.0f * logf((1.0f / y) - 1.0f); }
+
+static float normalize_kpt_conf_for_diag(float conf)
+{
+    if (!std::isfinite(conf))
+    {
+        return 0.0f;
+    }
+    if (conf < 0.0f || conf > 1.0f)
+    {
+        return sigmoid(conf);
+    }
+    return conf;
+}
+
+static float read_kpt_raw_conf(rknn_app_context_t *app_ctx,
+#if defined(RV1106_1103)
+                               rknn_tensor_mem **_outputs,
+#else
+                               rknn_output *_outputs,
+#endif
+                               int keypoint_count, int kpt_idx, int keypoints_index)
+{
+    if (keypoints_index < 0)
+    {
+        keypoints_index = 0;
+    }
+    if (keypoints_index >= keypoint_count)
+    {
+        keypoints_index = keypoint_count - 1;
+    }
+
+    if (app_ctx->is_quant)
+    {
+#if defined(RV1106_1103)
+        return deqnt_affine_u8_to_f32(((uint8_t *)_outputs[3].virt_addr)[kpt_idx * 3 * keypoint_count + 2 * keypoint_count + keypoints_index],
+                                      app_ctx->output_attrs[3].zp, app_ctx->output_attrs[3].scale);
+#elif defined(RKNPU1)
+        return deqnt_affine_u8_to_f32(((uint8_t *)_outputs[3].buf)[kpt_idx * 3 * keypoint_count + 2 * keypoint_count + keypoints_index],
+                                      app_ctx->output_attrs[3].zp, app_ctx->output_attrs[3].scale);
+#else
+        return (float)((rknpu2::float16 *)_outputs[3].buf)[kpt_idx * 3 * keypoint_count + 2 * keypoint_count + keypoints_index];
+#endif
+    }
+    else
+    {
+#if defined(RV1106_1103)
+        return ((float *)_outputs[3].virt_addr)[kpt_idx * 3 * keypoint_count + 2 * keypoint_count + keypoints_index];
+#else
+        return ((float *)_outputs[3].buf)[kpt_idx * 3 * keypoint_count + 2 * keypoint_count + keypoints_index];
+#endif
+    }
+}
 
 inline static int32_t __clip(float val, float min, float max)
 {
@@ -496,7 +578,41 @@ int post_process(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter
     {
         indexArray.push_back(i);
     }
+
+    std::vector<float> candidate_kpt_mean_norm(validCount, 0.0f);
+    uint64_t frame_raw_conf_count = 0;
+    uint64_t frame_raw_conf_neg = 0;
+    uint64_t frame_raw_conf_in_01 = 0;
+    uint64_t frame_raw_conf_gt1 = 0;
+    double frame_raw_conf_sum = 0.0;
+    for (int n = 0; n < validCount; ++n)
+    {
+        int keypoints_index = (int)filterBoxes[n * 5 + 4];
+        float kpt_conf_sum_norm = 0.0f;
+        for (int j = 0; j < 17; ++j)
+        {
+            float raw_conf = read_kpt_raw_conf(app_ctx, _outputs, keypoint_count, j, keypoints_index);
+            if (raw_conf < 0.0f)
+            {
+                frame_raw_conf_neg++;
+            }
+            else if (raw_conf <= 1.0f)
+            {
+                frame_raw_conf_in_01++;
+            }
+            else
+            {
+                frame_raw_conf_gt1++;
+            }
+            frame_raw_conf_count++;
+            frame_raw_conf_sum += raw_conf;
+            kpt_conf_sum_norm += normalize_kpt_conf_for_diag(raw_conf);
+        }
+        candidate_kpt_mean_norm[n] = kpt_conf_sum_norm / 17.0f;
+    }
+
     quick_sort_indice_inverse(objProbs, 0, validCount - 1, indexArray);
+    std::vector<int> sorted_before_nms = indexArray;
 
     std::set<int> class_set(std::begin(classId), std::end(classId));
     for (std::set<int>::iterator it = class_set.begin(); it != class_set.end(); ++it)
@@ -582,6 +698,148 @@ int post_process(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter
         last_count++;
     }
     od_results->count = last_count;
+
+    bool frame_nms_misselection = false;
+    float best_kept_obj_conf = -1.0f;
+    float best_kept_kpt_mean = 0.0f;
+    float best_supp_kpt_mean = 0.0f;
+    float best_supp_obj_conf = 0.0f;
+    int best_kept_n = -1;
+    int best_supp_n = -1;
+    for (int i = 0; i < validCount; ++i)
+    {
+        int n = indexArray[i];
+        if (n == -1)
+        {
+            continue;
+        }
+        if (objProbs[i] > best_kept_obj_conf)
+        {
+            best_kept_obj_conf = objProbs[i];
+            best_kept_kpt_mean = candidate_kpt_mean_norm[n];
+            best_kept_n = n;
+        }
+    }
+    if (best_kept_n >= 0)
+    {
+        const float kx1 = filterBoxes[best_kept_n * 5 + 0];
+        const float ky1 = filterBoxes[best_kept_n * 5 + 1];
+        const float kw = filterBoxes[best_kept_n * 5 + 2];
+        const float kh = filterBoxes[best_kept_n * 5 + 3];
+        const float kx2 = kx1 + kw;
+        const float ky2 = ky1 + kh;
+        for (int i = 0; i < validCount; ++i)
+        {
+            if (indexArray[i] != -1)
+            {
+                continue;
+            }
+            int n = sorted_before_nms[i];
+            if (n < 0 || classId[n] != classId[best_kept_n])
+            {
+                continue;
+            }
+            float sx1 = filterBoxes[n * 5 + 0];
+            float sy1 = filterBoxes[n * 5 + 1];
+            float sw = filterBoxes[n * 5 + 2];
+            float sh = filterBoxes[n * 5 + 3];
+            float sx2 = sx1 + sw;
+            float sy2 = sy1 + sh;
+            float iou = CalculateOverlap(kx1, ky1, kx2, ky2, sx1, sy1, sx2, sy2);
+            if (iou < POSE_DIAG_NMS_IOU_THRESH)
+            {
+                continue;
+            }
+            if (candidate_kpt_mean_norm[n] > best_supp_kpt_mean)
+            {
+                best_supp_kpt_mean = candidate_kpt_mean_norm[n];
+                best_supp_obj_conf = objProbs[i];
+                best_supp_n = n;
+            }
+        }
+        if (best_supp_n >= 0 && (best_supp_kpt_mean - best_kept_kpt_mean) > POSE_DIAG_NMS_KPT_MEAN_GAP_THRESH)
+        {
+            frame_nms_misselection = true;
+            g_pose_diag_nms_misselection.store(1);
+        }
+    }
+
+    float frame_raw_oor_ratio = 0.0f;
+    if (frame_raw_conf_count > 0)
+    {
+        frame_raw_oor_ratio = (float)(frame_raw_conf_neg + frame_raw_conf_gt1) / (float)frame_raw_conf_count;
+    }
+    if (frame_raw_oor_ratio > POSE_DIAG_SEMANTIC_OOR_RATIO_THRESH)
+    {
+        g_pose_diag_semantic_mismatch.store(1);
+    }
+
+    if (POSE_DIAG_ENABLE)
+    {
+        std::lock_guard<std::mutex> lock(g_pose_post_diag_mutex);
+        g_pose_post_diag_agg.frame_count++;
+        g_pose_post_diag_agg.candidates_before_nms_sum += validCount;
+        g_pose_post_diag_agg.candidates_after_nms_sum += last_count;
+        g_pose_post_diag_agg.raw_conf_count += frame_raw_conf_count;
+        g_pose_post_diag_agg.raw_conf_neg += frame_raw_conf_neg;
+        g_pose_post_diag_agg.raw_conf_in_01 += frame_raw_conf_in_01;
+        g_pose_post_diag_agg.raw_conf_gt1 += frame_raw_conf_gt1;
+        g_pose_post_diag_agg.raw_conf_sum += frame_raw_conf_sum;
+        if (frame_nms_misselection)
+        {
+            g_pose_post_diag_agg.nms_misselection_events++;
+        }
+
+        const bool print_now = (g_pose_post_diag_agg.frame_count % POSE_DIAG_PRINT_EVERY_N_FRAMES == 0);
+        if (print_now)
+        {
+            float frame_raw_mean = (frame_raw_conf_count > 0) ? (float)(frame_raw_conf_sum / (double)frame_raw_conf_count) : 0.0f;
+            printf("[POSE_DIAG][POST][frame=%llu] pre_nms=%d post_nms=%d raw_conf: neg=%llu in01=%llu gt1=%llu mean=%.4f oor_ratio=%.3f\n",
+                   (unsigned long long)g_pose_post_diag_agg.frame_count,
+                   validCount, last_count,
+                   (unsigned long long)frame_raw_conf_neg,
+                   (unsigned long long)frame_raw_conf_in_01,
+                   (unsigned long long)frame_raw_conf_gt1,
+                   frame_raw_mean, frame_raw_oor_ratio);
+            for (int i = 0; i < validCount; ++i)
+            {
+                int n = indexArray[i];
+                if (n == -1)
+                {
+                    continue;
+                }
+                printf("[POSE_DIAG][POST][kept] rank=%d obj=%.3f kpt_mean=%.3f box=(%.1f %.1f %.1f %.1f)\n",
+                       i, objProbs[i], candidate_kpt_mean_norm[n],
+                       filterBoxes[n * 5 + 0], filterBoxes[n * 5 + 1],
+                       filterBoxes[n * 5 + 2], filterBoxes[n * 5 + 3]);
+            }
+            if (frame_nms_misselection)
+            {
+                printf("[POSE_DIAG][POST][nms_misselection] kept_obj=%.3f kept_kpt_mean=%.3f supp_obj=%.3f supp_kpt_mean=%.3f gap=%.3f\n",
+                       best_kept_obj_conf, best_kept_kpt_mean, best_supp_obj_conf, best_supp_kpt_mean,
+                       best_supp_kpt_mean - best_kept_kpt_mean);
+            }
+            float agg_raw_oor_ratio = 0.0f;
+            float agg_raw_mean = 0.0f;
+            if (g_pose_post_diag_agg.raw_conf_count > 0)
+            {
+                agg_raw_oor_ratio = (float)(g_pose_post_diag_agg.raw_conf_neg + g_pose_post_diag_agg.raw_conf_gt1) /
+                                    (float)g_pose_post_diag_agg.raw_conf_count;
+                agg_raw_mean = (float)(g_pose_post_diag_agg.raw_conf_sum / (double)g_pose_post_diag_agg.raw_conf_count);
+            }
+            printf("[POSE_DIAG][POST][agg] frames=%llu pre_nms_avg=%.2f post_nms_avg=%.2f raw_conf_mean=%.4f raw_oor_ratio=%.3f nms_misselection_events=%llu\n",
+                   (unsigned long long)g_pose_post_diag_agg.frame_count,
+                   (g_pose_post_diag_agg.frame_count > 0)
+                       ? (double)g_pose_post_diag_agg.candidates_before_nms_sum / (double)g_pose_post_diag_agg.frame_count
+                       : 0.0,
+                   (g_pose_post_diag_agg.frame_count > 0)
+                       ? (double)g_pose_post_diag_agg.candidates_after_nms_sum / (double)g_pose_post_diag_agg.frame_count
+                       : 0.0,
+                   agg_raw_mean, agg_raw_oor_ratio,
+                   (unsigned long long)g_pose_post_diag_agg.nms_misselection_events);
+        }
+    }
+
     return 0;
 }
 
