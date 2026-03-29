@@ -62,8 +62,10 @@ char fps_text[16];
 float fps = 0;
 int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8,
                     7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
-static const float DRAW_BOX_THRESH = 0.70f;
-static const float DRAW_KPT_THRESH = 0.50f;
+static const float DRAW_BOX_THRESH = 0.85f;
+static const float DRAW_KPT_THRESH = 0.55f;
+static const int DRAW_MIN_KPT_NUM = 6;
+static const float DRAW_MIN_BOX_AREA_RATIO = 0.03f;
 
 // 线程池
 ThreadPool rknnPool(2);
@@ -183,6 +185,31 @@ void rknn_task(VIDEO_FRAME_INFO_S stViFrame) {
 		int y1 = det_result->box.top;
 		int x2 = det_result->box.right;
 		int y2 = det_result->box.bottom;
+		int box_w = x2 - x1;
+		int box_h = y2 - y1;
+		if (box_w <= 0 || box_h <= 0)
+		{
+			continue;
+		}
+
+		float box_area_ratio = (float)(box_w * box_h) / (float)(src_image.width * src_image.height);
+		if (box_area_ratio < DRAW_MIN_BOX_AREA_RATIO)
+		{
+			continue;
+		}
+
+		int valid_kpt_num = 0;
+		for (int j = 0; j < 17; ++j)
+		{
+			if (det_result->keypoints[j][2] >= DRAW_KPT_THRESH)
+			{
+				valid_kpt_num++;
+			}
+		}
+		if (valid_kpt_num < DRAW_MIN_KPT_NUM)
+		{
+			continue;
+		}
 
 		draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
 
